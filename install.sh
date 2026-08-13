@@ -97,8 +97,10 @@ UNIT
 elif command -v tmux >/dev/null; then
   say "no systemd access — supervising with a tmux loop"
   tmux kill-session -t dispatchd 2>/dev/null || true
+  # HOME and PATH explicitly: a tmux session inherits the tmux SERVER's
+  # environment (whatever shell started it, whenever), not this installer's.
   tmux new-session -d -s dispatchd \
-    "while true; do DISPATCH_PORT=$PORT DISPATCH_WORKSPACE=$DISPATCH_WORKSPACE $BIN >> /tmp/dispatchd.log 2>&1; sleep 2; done"
+    "while true; do HOME='$HOME' PATH='$PATH' DISPATCH_PORT=$PORT DISPATCH_WORKSPACE='$DISPATCH_WORKSPACE' '$BIN' >> /tmp/dispatchd.log 2>&1; sleep 2; done"
 else
   fail "no systemd and no tmux — install tmux and re-run"
 fi
