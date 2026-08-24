@@ -41,6 +41,15 @@ if [ -n "$missing" ]; then
   fi
 fi
 
+# qrencode is best-effort: it draws the pairing QR at the end. Never a reason
+# to fail the install — without it the card degrades to URL + token as text.
+if ! command -v qrencode >/dev/null; then
+  if command -v apt-get >/dev/null; then $SUDO apt-get install -y -qq qrencode >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null; then $SUDO dnf install -y -q qrencode >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null; then $SUDO apk add -q libqrencode-tools >/dev/null 2>&1 || $SUDO apk add -q libqrencode >/dev/null 2>&1 || true
+  fi
+fi
+
 # --- binary ---
 if [ -w /usr/local/bin ] || [ -n "$SUDO" ]; then BIN_DIR=/usr/local/bin; else BIN_DIR="$HOME/.local/bin"; mkdir -p "$BIN_DIR"; fi
 BIN="$BIN_DIR/dispatchd"
@@ -126,4 +135,20 @@ printf '\n  \033[1mPair this box in the Dispatch app\033[0m  (Settings → Boxes
 [ -n "$PUB" ]    && printf '    Server:  http://%s:%s   (public — open port %s in the firewall)\n' "$PUB" "$PORT" "$PORT"
 [ -n "$IPS" ]    && printf '    Server:  http://%s:%s   (LAN)\n' "$(echo "$IPS" | awk '{print $1}')" "$PORT"
 printf '    Token:   %s\n\n' "$TOKEN"
+
+# --- QR pairing: the app already handles dispatch://pair?server=…&token=… ---
+# Prefer the tailnet hostname (reachable from the phone without opening ports),
+# fall back to LAN. The public IP never goes in the QR: scanning must not be
+# the thing that nudges someone into exposing :4000 to the internet.
+PAIR_HOST="${TSHOST:-$(echo "${IPS:-}" | awk '{print $1}')}"
+if command -v qrencode >/dev/null && [ -n "$PAIR_HOST" ]; then
+  # Percent-encode the server URL: it rides inside a query param, and the
+  # app's Linking.parse decodes params — ':' and '/' must not read as URL
+  # structure. The token is hex, safe as-is.
+  ENC_SERVER="$(printf 'http://%s:%s' "$PAIR_HOST" "$PORT" | sed -e 's,%,%25,g' -e 's,:,%3A,g' -e 's,/,%2F,g')"
+  printf '  \033[1mOr scan with the phone camera\033[0m — opens the Dispatch app and pairs in one tap:\n\n'
+  qrencode -t ANSIUTF8 -m 2 "dispatch://pair?server=$ENC_SERVER&token=$TOKEN" | sed 's/^/    /'
+  printf '\n'
+fi
+
 say "update later from the app, or: curl -X POST -H \"Authorization: Bearer \$(cat ~/.dispatch/token)\" http://127.0.0.1:$PORT/update"
