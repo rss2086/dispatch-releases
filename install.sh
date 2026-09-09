@@ -51,7 +51,12 @@ if ! command -v qrencode >/dev/null; then
 fi
 
 # --- binary ---
-if [ -w /usr/local/bin ] || [ -n "$SUDO" ]; then BIN_DIR=/usr/local/bin; else BIN_DIR="$HOME/.local/bin"; mkdir -p "$BIN_DIR"; fi
+# Self-update atomically renames a sibling file over the executable. The
+# directory must therefore belong to the service user, even when that user
+# has sudo for installing the systemd unit. /usr/local/bin broke updates on
+# existing non-root services with EACCES creating dispatchd.next.
+BIN_DIR="$HOME/.local/bin"
+mkdir -p "$BIN_DIR"
 BIN="$BIN_DIR/dispatchd"
 URL="https://github.com/$REPO/releases/latest/download/dispatchd-linux-$ARCH"
 say "downloading dispatchd-linux-$ARCH from $REPO"
@@ -62,7 +67,7 @@ WANT="$(grep "dispatchd-linux-$ARCH\$" "$TMP.sums" | awk '{print $1}')"
 GOT="$(sha256sum "$TMP" | awk '{print $1}')"
 [ -n "$WANT" ] && [ "$WANT" = "$GOT" ] || fail "checksum mismatch — refusing to install"
 chmod 755 "$TMP"
-${SUDO:+$SUDO }mv "$TMP" "$BIN"
+mv "$TMP" "$BIN"
 rm -f "$TMP.sums"
 say "installed $BIN ($("$BIN" --version 2>/dev/null || echo binary))"
 
