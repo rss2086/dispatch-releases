@@ -102,6 +102,12 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$HOME/.bun/bin:$H
 ExecStart=$BIN
 Restart=always
 RestartSec=2
+# Agent sessions run in tmux under this service's cgroup. The default
+# control-group kill on stop/restart took every running agent down with the
+# daemon — a self-update at 20:00 killed a Codex implementer mid-turn. Kill
+# only the daemon; the tmux server and its sessions survive, and the next
+# dispatchd re-reads them from the same tmux socket.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
