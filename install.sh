@@ -103,9 +103,20 @@ RUN_USER="$(id -un)"
 if [ -n "$ON_SPRITE" ]; then
   say "sprite runtime detected — registering dispatchd as a sprite-env service"
   sprite-env services delete dispatchd >/dev/null 2>&1 || true
+  # The runtime restarts a service that CRASHES but not one that exits
+  # cleanly — and self-update exits cleanly after swapping the binary
+  # (observed 2026-10-04: service "running" with a dead pid, :4000 closed).
+  # So the service is a loop around the binary, like the tmux fallback.
+  LOOP="$BIN_DIR/dispatchd-loop.sh"
+  cat > "$LOOP" <<LOOPEOF
+#!/usr/bin/env bash
+# Written by install.sh: keeps dispatchd up across clean exits (self-update).
+while true; do "$BIN"; sleep 2; done
+LOOPEOF
+  chmod 755 "$LOOP"
   # --env is comma-separated: PATH may hold colons but never commas.
   sprite-env services create dispatchd \
-    --cmd "$BIN" --dir "$HOME" \
+    --cmd /usr/bin/env --args "bash,$LOOP" --dir "$HOME" \
     --env "HOME=$HOME,DISPATCH_PORT=$PORT,DISPATCH_WORKSPACE=$DISPATCH_WORKSPACE,PATH=$HOME/.local/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:/.sprite/bin:/usr/local/bin:/usr/bin:/bin" \
     --http-port "$PORT" --no-stream >/dev/null
 elif command -v systemctl >/dev/null && { [ "$(id -u)" = 0 ] || [ -n "$SUDO" ]; }; then
