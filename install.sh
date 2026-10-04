@@ -173,11 +173,17 @@ PUB="$(curl -fsS -m 4 https://api.ipify.org 2>/dev/null || true)"
 TSHOST="$(command -v tailscale >/dev/null && tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)"
 SPRITE_URL=""
 [ -n "$ON_SPRITE" ] && SPRITE_URL="$(sprite-env info 2>/dev/null | jq -r '.sprite_url // empty')"
+# Pairing relay: the box dialled out at boot; when it is connected, this URL
+# works from any network — no Tailscale, no open port.
+RELAY_URL="$(printf '%s' "$HEALTH" | jq -r '.relay.publicUrl // empty' 2>/dev/null || true)"
+RELAY_UP="$(printf '%s' "$HEALTH" | jq -r '.relay.connected // false' 2>/dev/null || echo false)"
+[ "$RELAY_UP" = "true" ] || RELAY_URL=""
 
 printf '\n'
 say "dispatchd $VERSION is running ✓"
 printf '\n  \033[1mPair this box in the Dispatch app\033[0m  (Settings → Boxes → Add box)\n\n'
 [ -n "$SPRITE_URL" ] && printf '    Server:  %s   (sprite — public HTTPS, preferred)\n' "$SPRITE_URL"
+[ -n "$RELAY_URL" ]  && printf '    Server:  %s   (relay — works from anywhere)\n' "$RELAY_URL"
 [ -n "$TSHOST" ] && printf '    Server:  http://%s:%s   (tailnet — preferred)\n' "$TSHOST" "$PORT"
 # On a sprite only the HTTPS proxy is reachable: the public and LAN lines would
 # be wrong advice ("open port 4000") for an address nothing can route to.
@@ -192,6 +198,7 @@ printf '    Token:   %s\n\n' "$TOKEN"
 # public IP: scanning must not be the thing that nudges someone into exposing
 # plain :4000 to the internet.
 if [ -n "$SPRITE_URL" ]; then PAIR_SERVER="$SPRITE_URL"
+elif [ -n "$RELAY_URL" ]; then PAIR_SERVER="$RELAY_URL"
 elif [ -n "$TSHOST" ]; then PAIR_SERVER="http://$TSHOST:$PORT"
 elif [ -n "${IPS:-}" ]; then PAIR_SERVER="http://$(echo "$IPS" | awk '{print $1}'):$PORT"
 else PAIR_SERVER=""; fi
