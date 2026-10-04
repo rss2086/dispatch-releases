@@ -16,7 +16,8 @@ PORT="${DISPATCH_PORT:-4000}"
 say()  { printf '\033[1m[dispatch]\033[0m %s\n' "$*"; }
 fail() { printf '\033[31m[dispatch]\033[0m %s\n' "$*" >&2; exit 1; }
 
-[ "$(uname -s)" = "Linux" ] || fail "dispatchd runs on Linux boxes (this is $(uname -s))"
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+case "$OS" in linux|darwin) ;; *) fail "dispatchd runs on Linux boxes and macOS laptops (this is $(uname -s))" ;; esac
 case "$(uname -m)" in
   x86_64|amd64)  ARCH=x64 ;;
   aarch64|arm64) ARCH=arm64 ;;
@@ -38,7 +39,8 @@ missing=""
 for dep in curl tmux git jq; do command -v "$dep" >/dev/null || missing="$missing $dep"; done
 if [ -n "$missing" ]; then
   say "installing dependencies:$missing"
-  if command -v apt-get >/dev/null && [ -n "$SUDO$([ "$(id -u)" = 0 ] && echo root)" ]; then
+  if [ "$OS" = darwin ]; then fail "please install$missing (brew install${missing}) and re-run"
+  elif command -v apt-get >/dev/null && [ -n "$SUDO$([ "$(id -u)" = 0 ] && echo root)" ]; then
     $SUDO apt-get update -qq && $SUDO apt-get install -y -qq $missing
   elif command -v dnf >/dev/null; then $SUDO dnf install -y -q $missing
   elif command -v apk >/dev/null; then $SUDO apk add -q $missing
@@ -70,13 +72,14 @@ if [ -n "${DISPATCH_BINARY:-}" ]; then
   say "installing local binary $DISPATCH_BINARY"
   TMP="$(mktemp)"; cp "$DISPATCH_BINARY" "$TMP"
 else
-  URL="https://github.com/$REPO/releases/latest/download/dispatchd-linux-$ARCH"
-  say "downloading dispatchd-linux-$ARCH from $REPO"
+  ASSET="dispatchd-$OS-$ARCH"
+  URL="https://github.com/$REPO/releases/latest/download/$ASSET"
+  say "downloading $ASSET from $REPO"
   TMP="$(mktemp)"
   curl -fSL --progress-bar "$URL" -o "$TMP"
   curl -fsSL "https://github.com/$REPO/releases/latest/download/checksums.txt" -o "$TMP.sums"
-  WANT="$(grep "dispatchd-linux-$ARCH\$" "$TMP.sums" | awk '{print $1}')"
-  GOT="$(sha256sum "$TMP" | awk '{print $1}')"
+  WANT="$(grep "$ASSET\$" "$TMP.sums" | awk '{print $1}')"
+  if command -v sha256sum >/dev/null; then GOT="$(sha256sum "$TMP" | awk '{print $1}')"; else GOT="$(shasum -a 256 "$TMP" | awk '{print $1}')"; fi
   [ -n "$WANT" ] && [ "$WANT" = "$GOT" ] || fail "checksum mismatch — refusing to install"
   rm -f "$TMP.sums"
 fi
@@ -95,12 +98,38 @@ if curl -sf -m 3 "http://127.0.0.1:$PORT/health" | grep -q '"ok":true'; then
   tmux kill-session -t dispatch-server 2>/dev/null || true
   ${SUDO:+$SUDO }systemctl stop dispatchd 2>/dev/null || true
   if [ -n "$ON_SPRITE" ]; then sprite-env services stop dispatchd >/dev/null 2>&1 || true; fi
+  if [ "$OS" = darwin ]; then launchctl unload "$HOME/Library/LaunchAgents/com.dispatch.dispatchd.plist" 2>/dev/null || true; fi
   sleep 1
 fi
 
 # --- supervision: systemd unit when we can, tmux loop when we cannot ---
 RUN_USER="$(id -un)"
-if [ -n "$ON_SPRITE" ]; then
+if [ "$OS" = darwin ]; then
+  # A laptop is a box too: a LaunchAgent keeps dispatchd up while you are
+  # logged in (reachable through the pairing relay, no Tailscale needed).
+  say "macOS — installing a LaunchAgent (runs at login)"
+  PLIST="$HOME/Library/LaunchAgents/com.dispatch.dispatchd.plist"
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.dispatch"
+  cat > "$PLIST" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.dispatch.dispatchd</string>
+  <key>ProgramArguments</key><array><string>$BIN</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>$HOME</string>
+    <key>DISPATCH_PORT</key><string>$PORT</string>
+    <key>DISPATCH_WORKSPACE</key><string>$DISPATCH_WORKSPACE</string>
+    <key>PATH</key><string>$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$HOME/.dispatch/dispatchd.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.dispatch/dispatchd.log</string>
+</dict></plist>
+PL
+  launchctl unload "$PLIST" 2>/dev/null || true
+  launchctl load "$PLIST"
+elif [ -n "$ON_SPRITE" ]; then
   say "sprite runtime detected — registering dispatchd as a sprite-env service"
   sprite-env services delete dispatchd >/dev/null 2>&1 || true
   # The runtime restarts a service that CRASHES but not one that exits
@@ -164,11 +193,11 @@ for _ in $(seq 1 20); do
   HEALTH="$(curl -sf -m 2 "http://127.0.0.1:$PORT/health" || true)"
   [ -n "$HEALTH" ] && break
 done
-[ -n "${HEALTH:-}" ] || fail "server did not come up — check: journalctl -u dispatchd -n 50 (or /tmp/dispatchd.log)"
+[ -n "${HEALTH:-}" ] || fail "server did not come up — check: journalctl -u dispatchd -n 50, /tmp/dispatchd.log, or ~/.dispatch/dispatchd.log on macOS"
 
 TOKEN="$(cat "$HOME/.dispatch/token")"
 VERSION="$(printf '%s' "$HEALTH" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
-IPS="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -Ev '^(127\.|::|$)' | head -3 | tr '\n' ' ')"
+IPS="$( (hostname -I 2>/dev/null || ipconfig getifaddr en0 2>/dev/null) | tr ' ' '\n' | grep -Ev '^(127\.|::|$)' | head -3 | tr '\n' ' ')"
 PUB="$(curl -fsS -m 4 https://api.ipify.org 2>/dev/null || true)"
 TSHOST="$(command -v tailscale >/dev/null && tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)"
 SPRITE_URL=""
