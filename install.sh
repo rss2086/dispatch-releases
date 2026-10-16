@@ -121,6 +121,7 @@ if [ "$OS" = darwin ]; then
     <key>DISPATCH_PORT</key><string>$PORT</string>
     <key>DISPATCH_WORKSPACE</key><string>$DISPATCH_WORKSPACE</string>
     <key>PATH</key><string>$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>LANG</key><string>en_US.UTF-8</string>
   </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$HOME/.dispatch/dispatchd.log</string>
