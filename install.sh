@@ -7,7 +7,11 @@
 # pairing card (server URL + token) to add this box in the Dispatch app.
 # Idempotent: re-running upgrades the binary and leaves token/state alone.
 # The binary itself extracts agent hooks and wires ~/.claude/settings.json on
-# boot, so this script's job is only: binary on disk, process supervised.
+# boot. On a Fly Sprite (or with DISPATCH_FULL=1) this script also provisions
+# the box so the first session has what the operator's own box has: gh, the
+# starter profile (CLAUDE.md, settings, skills), opencode, agent-browser.
+# Every provisioning step is best-effort — a box that pairs with one tool
+# missing beats one that never pairs.
 set -euo pipefail
 
 REPO="${DISPATCH_RELEASES_REPO:-rss2086/dispatch-releases}"
@@ -15,6 +19,95 @@ PORT="${DISPATCH_PORT:-4000}"
 
 say()  { printf '\033[1m[dispatch]\033[0m %s\n' "$*"; }
 fail() { printf '\033[31m[dispatch]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- provisioning (sprite, or DISPATCH_FULL=1) ------------------------------
+# Foreground: small and needed by the first session (gh, profile). Background:
+# large downloads (opencode, Chrome) that must not hold up pairing. Each step
+# logs to ~/.dispatch/provision.log and never fails the install.
+PLOG="$HOME/.dispatch/provision.log"
+plog() { mkdir -p "$HOME/.dispatch"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$PLOG"; }
+
+provision_gh() {
+  command -v gh >/dev/null && { plog "gh: present"; return 0; }
+  local tag ver tmp arch
+  arch="$([ "$ARCH" = x64 ] && echo amd64 || echo arm64)"
+  tag="$(curl -fsSL -m 15 https://api.github.com/repos/cli/cli/releases/latest 2>/dev/null | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -1)"
+  if [ -n "$tag" ]; then
+    tmp="$(mktemp -d)"
+    if curl -fsSL -m 120 "https://github.com/cli/cli/releases/download/v$tag/gh_${tag}_${OS}_${arch}.tar.gz" | tar -xz -C "$tmp" 2>/dev/null \
+       && install -m 755 "$tmp"/gh_*/bin/gh "$BIN_DIR/gh"; then
+      rm -rf "$tmp"; plog "gh: installed $tag"; return 0
+    fi
+    rm -rf "$tmp"
+  fi
+  if command -v apt-get >/dev/null && [ -n "${SUDO:-}$([ "$(id -u)" = 0 ] && echo root)" ]; then
+    ${SUDO:-} apt-get install -y -qq gh >/dev/null 2>&1 && { plog "gh: installed via apt"; return 0; }
+  fi
+  plog "gh: FAILED (install it later: https://cli.github.com)"; return 0
+}
+
+# ~/.claude/{CLAUDE.md,settings.json,skills/*} from the release's profile.tar.gz.
+# Existing files win: re-running never overwrites a person's edits.
+provision_profile() {
+  local tmp url n=0
+  tmp="$(mktemp -d)"
+  if [ -n "${DISPATCH_PROFILE_TAR:-}" ]; then
+    tar -xzf "$DISPATCH_PROFILE_TAR" -C "$tmp" 2>/dev/null || { plog "profile: bad local tarball"; rm -rf "$tmp"; return 0; }
+  else
+    url="https://github.com/$REPO/releases/latest/download/profile.tar.gz"
+    curl -fsSL -m 60 "$url" | tar -xz -C "$tmp" 2>/dev/null || { plog "profile: download failed ($url)"; rm -rf "$tmp"; return 0; }
+  fi
+  mkdir -p "$HOME/.claude/skills"
+  for f in CLAUDE.md settings.json; do
+    [ -f "$tmp/$f" ] || continue
+    if [ -e "$HOME/.claude/$f" ]; then plog "profile: kept existing $f"; else cp "$tmp/$f" "$HOME/.claude/$f"; n=$((n+1)); fi
+  done
+  if [ -d "$tmp/skills" ]; then
+    for d in "$tmp"/skills/*/; do
+      [ -d "$d" ] || continue
+      local name; name="$(basename "$d")"
+      if [ -e "$HOME/.claude/skills/$name" ]; then plog "profile: kept existing skill $name"; else cp -R "$d" "$HOME/.claude/skills/$name"; n=$((n+1)); fi
+    done
+  fi
+  rm -rf "$tmp"
+  plog "profile: $n new item(s)"
+}
+
+# Big downloads, detached: the pairing card must not wait on Chrome.
+provision_background() {
+  (
+    plog "background: start"
+    export PATH="$BIN_DIR:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.opencode/bin:$PATH"
+    if ! command -v opencode >/dev/null; then
+      if curl -fsSL -m 60 https://opencode.ai/install 2>/dev/null | bash >/dev/null 2>&1; then plog "opencode: installed"; else plog "opencode: FAILED"; fi
+    else plog "opencode: present"; fi
+    if command -v npm >/dev/null; then
+      mkdir -p "$HOME/.npm-global"; npm config set prefix "$HOME/.npm-global" >/dev/null 2>&1 || true
+      if ! command -v agent-browser >/dev/null; then
+        if npm install -g agent-browser >/dev/null 2>&1; then plog "agent-browser: installed"; else plog "agent-browser: FAILED"; fi
+      else plog "agent-browser: present"; fi
+      if command -v agent-browser >/dev/null && [ ! -d "$HOME/.agent-browser/browsers" ]; then
+        if agent-browser install >/dev/null 2>&1; then plog "chrome: installed"; else plog "chrome: FAILED"; fi
+      fi
+    else plog "agent-browser: no npm, skipped"; fi
+    if command -v claude >/dev/null; then
+      if timeout 120 claude plugin marketplace add obra/superpowers-marketplace </dev/null >/dev/null 2>&1 \
+         && timeout 120 claude plugin install superpowers@superpowers-marketplace --scope user </dev/null >/dev/null 2>&1; then plog "superpowers: installed"; else plog "superpowers: FAILED (install from the app later)"; fi
+    fi
+    plog "background: done"
+    date -u +%FT%TZ > "$HOME/.dispatch/provisioned"
+  ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+provision_foreground() {
+  mkdir -p "$BIN_DIR"
+  export PATH="$BIN_DIR:$PATH"
+  plog "foreground: start"
+  provision_gh
+  provision_profile
+  plog "foreground: done"
+}
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$OS" in linux|darwin) ;; *) fail "dispatchd runs on Linux boxes and macOS laptops (this is $(uname -s))" ;; esac
@@ -28,6 +121,16 @@ esac
 # routes the sprite's public HTTPS URL to one service's port.
 ON_SPRITE=""
 if [ -S /.sprite/api.sock ] && command -v sprite-env >/dev/null; then ON_SPRITE=1; fi
+
+# Provision fully on a sprite, or anywhere that asks for it.
+FULL="${DISPATCH_FULL:-$ON_SPRITE}"
+# Test hook: run only the provisioning stage against this HOME, then exit.
+if [ -n "${DISPATCH_PROVISION_ONLY:-}" ]; then
+  BIN_DIR="$HOME/.local/bin"; SUDO=""
+  provision_foreground
+  [ -n "${DISPATCH_PROVISION_SKIP_BACKGROUND:-}" ] || provision_background
+  exit 0
+fi
 
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -86,6 +189,12 @@ fi
 chmod 755 "$TMP"
 mv "$TMP" "$BIN"
 say "installed $BIN ($("$BIN" --version 2>/dev/null || echo binary))"
+
+# --- provisioning, foreground part: what the first session needs ---
+if [ -n "$FULL" ]; then
+  say "provisioning the box (gh, starter profile)"
+  provision_foreground || true
+fi
 
 # --- workspace root: where projects live and sessions start ---
 if [ -z "${DISPATCH_WORKSPACE:-}" ]; then
@@ -243,3 +352,9 @@ if command -v qrencode >/dev/null && [ -n "$PAIR_SERVER" ]; then
 fi
 
 say "update later from the app, or: curl -X POST -H \"Authorization: Bearer \$(cat ~/.dispatch/token)\" http://127.0.0.1:$PORT/update"
+
+# --- provisioning, background part: opencode, agent-browser + Chrome ---
+if [ -n "$FULL" ]; then
+  say "finishing setup in the background (opencode, browser) — log: $PLOG"
+  provision_background || true
+fi
