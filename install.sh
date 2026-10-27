@@ -31,7 +31,7 @@ provision_gh() {
   command -v gh >/dev/null && { plog "gh: present"; return 0; }
   local tag ver tmp arch
   arch="$([ "$ARCH" = x64 ] && echo amd64 || echo arm64)"
-  tag="$(curl -fsSL -m 15 https://api.github.com/repos/cli/cli/releases/latest 2>/dev/null | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -1)"
+  tag="$(curl -fsSL -m 15 https://api.github.com/repos/cli/cli/releases/latest 2>/dev/null | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -1 || true)"
   if [ -n "$tag" ]; then
     tmp="$(mktemp -d)"
     if curl -fsSL -m 120 "https://github.com/cli/cli/releases/download/v$tag/gh_${tag}_${OS}_${arch}.tar.gz" | tar -xz -C "$tmp" 2>/dev/null \
@@ -55,7 +55,8 @@ provision_profile() {
     tar -xzf "$DISPATCH_PROFILE_TAR" -C "$tmp" 2>/dev/null || { plog "profile: bad local tarball"; rm -rf "$tmp"; return 0; }
   else
     url="https://github.com/$REPO/releases/latest/download/profile.tar.gz"
-    curl -fsSL -m 60 "$url" | tar -xz -C "$tmp" 2>/dev/null || { plog "profile: download failed ($url)"; rm -rf "$tmp"; return 0; }
+    # 20 s cap: this runs before the service starts, inside the broker's budget.
+    curl -fsSL -m 20 "$url" | tar -xz -C "$tmp" 2>/dev/null || { plog "profile: download failed ($url)"; rm -rf "$tmp"; return 0; }
   fi
   mkdir -p "$HOME/.claude/skills"
   for f in CLAUDE.md settings.json; do
@@ -73,39 +74,60 @@ provision_profile() {
   plog "profile: $n new item(s)"
 }
 
-# Big downloads, detached: the pairing card must not wait on Chrome.
+# Everything with a download, detached: the pairing card must not wait on
+# Chrome, and the broker's exec budget must not pay for GitHub being slow.
+# setsid puts it in its own session so the end of the installer's shell (a
+# sprite exec, an ssh) does not take it down.
 provision_background() {
-  (
-    plog "background: start"
-    export PATH="$BIN_DIR:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.opencode/bin:$PATH"
-    if ! command -v opencode >/dev/null; then
-      if curl -fsSL -m 60 https://opencode.ai/install 2>/dev/null | bash >/dev/null 2>&1; then plog "opencode: installed"; else plog "opencode: FAILED"; fi
-    else plog "opencode: present"; fi
-    if command -v npm >/dev/null; then
-      mkdir -p "$HOME/.npm-global"; npm config set prefix "$HOME/.npm-global" >/dev/null 2>&1 || true
-      if ! command -v agent-browser >/dev/null; then
-        if npm install -g agent-browser >/dev/null 2>&1; then plog "agent-browser: installed"; else plog "agent-browser: FAILED"; fi
-      else plog "agent-browser: present"; fi
-      if command -v agent-browser >/dev/null && [ ! -d "$HOME/.agent-browser/browsers" ]; then
-        if agent-browser install >/dev/null 2>&1; then plog "chrome: installed"; else plog "chrome: FAILED"; fi
-      fi
-    else plog "agent-browser: no npm, skipped"; fi
-    if command -v claude >/dev/null; then
-      if timeout 120 claude plugin marketplace add obra/superpowers-marketplace </dev/null >/dev/null 2>&1 \
-         && timeout 120 claude plugin install superpowers@superpowers-marketplace --scope user </dev/null >/dev/null 2>&1; then plog "superpowers: installed"; else plog "superpowers: FAILED (install from the app later)"; fi
-    fi
-    plog "background: done"
-    date -u +%FT%TZ > "$HOME/.dispatch/provisioned"
-  ) </dev/null >/dev/null 2>&1 &
+  local runner="$HOME/.dispatch/provision-bg.sh"
+  mkdir -p "$HOME/.dispatch"
+  cat > "$runner" <<BGEOF
+#!/usr/bin/env bash
+# Written by install.sh: the background half of provisioning. Safe to re-run.
+set -u
+BIN_DIR="$BIN_DIR"; PORT="$PORT"; OS="$OS"; ARCH="$ARCH"; REPO="$REPO"; SUDO="${SUDO:-}"
+PLOG="$PLOG"
+$(declare -f plog provision_gh)
+plog "background: start"
+export PATH="\$BIN_DIR:\$HOME/.bun/bin:\$HOME/.npm-global/bin:\$HOME/.opencode/bin:\$PATH"
+provision_gh
+# dispatchd wires its hooks into ~/.claude/settings.json at boot; the plugin
+# install below rewrites the same file. Wait for the boot to be over first.
+for i in \$(seq 1 60); do curl -sf -m 2 "http://127.0.0.1:\$PORT/health" >/dev/null 2>&1 && break; sleep 2; done
+sleep 3
+BGEOF
+  cat >> "$runner" <<'BGEOF'
+if ! command -v opencode >/dev/null; then
+  if curl -fsSL -m 60 https://opencode.ai/install 2>/dev/null | bash >/dev/null 2>&1; then plog "opencode: installed"; else plog "opencode: FAILED"; fi
+else plog "opencode: present"; fi
+if command -v npm >/dev/null; then
+  mkdir -p "$HOME/.npm-global"; npm config set prefix "$HOME/.npm-global" >/dev/null 2>&1 || true
+  if ! command -v agent-browser >/dev/null; then
+    if npm install -g agent-browser >/dev/null 2>&1; then plog "agent-browser: installed"; else plog "agent-browser: FAILED"; fi
+  else plog "agent-browser: present"; fi
+  if command -v agent-browser >/dev/null && [ ! -d "$HOME/.agent-browser/browsers" ]; then
+    if agent-browser install >/dev/null 2>&1; then plog "chrome: installed"; else plog "chrome: FAILED"; fi
+  fi
+else plog "agent-browser: no npm, skipped"; fi
+if command -v claude >/dev/null; then
+  if timeout 120 claude plugin marketplace add obra/superpowers-marketplace </dev/null >/dev/null 2>&1      && timeout 120 claude plugin install superpowers@superpowers-marketplace --scope user </dev/null >/dev/null 2>&1; then plog "superpowers: installed"; else plog "superpowers: FAILED (install from the app later)"; fi
+fi
+plog "background: done"
+date -u +%FT%TZ > "$HOME/.dispatch/provisioned"
+BGEOF
+  chmod 700 "$runner"
+  if command -v setsid >/dev/null; then setsid bash "$runner" </dev/null >/dev/null 2>&1 &
+  else nohup bash "$runner" </dev/null >/dev/null 2>&1 & fi
   disown 2>/dev/null || true
 }
 
+# Only the profile runs before the service: small, and the first session
+# should read the box's CLAUDE.md. Tools come in the background.
 provision_foreground() {
   mkdir -p "$BIN_DIR"
   export PATH="$BIN_DIR:$PATH"
   plog "foreground: start"
-  provision_gh
-  provision_profile
+  provision_profile || true
   plog "foreground: done"
 }
 
@@ -127,8 +149,8 @@ FULL="${DISPATCH_FULL:-$ON_SPRITE}"
 # Test hook: run only the provisioning stage against this HOME, then exit.
 if [ -n "${DISPATCH_PROVISION_ONLY:-}" ]; then
   BIN_DIR="$HOME/.local/bin"; SUDO=""
-  provision_foreground
-  [ -n "${DISPATCH_PROVISION_SKIP_BACKGROUND:-}" ] || provision_background
+  provision_foreground || true
+  [ -n "${DISPATCH_PROVISION_SKIP_BACKGROUND:-}" ] || provision_background || true
   exit 0
 fi
 
@@ -192,7 +214,7 @@ say "installed $BIN ($("$BIN" --version 2>/dev/null || echo binary))"
 
 # --- provisioning, foreground part: what the first session needs ---
 if [ -n "$FULL" ]; then
-  say "provisioning the box (gh, starter profile)"
+  say "provisioning the box (starter profile)"
   provision_foreground || true
 fi
 
@@ -355,6 +377,6 @@ say "update later from the app, or: curl -X POST -H \"Authorization: Bearer \$(c
 
 # --- provisioning, background part: opencode, agent-browser + Chrome ---
 if [ -n "$FULL" ]; then
-  say "finishing setup in the background (opencode, browser) — log: $PLOG"
+  say "finishing setup in the background (gh, opencode, browser) — log: $PLOG"
   provision_background || true
 fi
