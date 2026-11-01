@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Dispatch one-line installer.
+# Thumbs one-line installer (dispatchd compatibility command).
 #
 #   curl -fsSL https://raw.githubusercontent.com/rss2086/dispatch-releases/main/install.sh | bash
 #
 # Installs the dispatchd single binary, starts it as a service, and prints the
-# pairing card (server URL + token) to add this box in the Dispatch app.
+# pairing card (server URL + token) to add this box in the Thumbs app.
 # Idempotent: re-running upgrades the binary and leaves token/state alone.
 # The binary itself extracts agent hooks and wires ~/.claude/settings.json on
 # boot. On a Fly Sprite (or with DISPATCH_FULL=1) this script also provisions
 # the box so the first session has what the operator's own box has: gh, the
 # starter profile (CLAUDE.md, settings, skills), opencode, agent-browser.
-# Every provisioning step is best-effort — a box that pairs with one tool
-# missing beats one that never pairs.
+# Extras are best-effort. Managed computers report required-agent readiness
+# separately so the broker never hands out a half-prepared computer.
 set -euo pipefail
 
 REPO="${DISPATCH_RELEASES_REPO:-rss2086/dispatch-releases}"
 PORT="${DISPATCH_PORT:-4000}"
 
-say()  { printf '\033[1m[dispatch]\033[0m %s\n' "$*"; }
-fail() { printf '\033[31m[dispatch]\033[0m %s\n' "$*" >&2; exit 1; }
+say()  { printf '\033[1m[thumbs]\033[0m %s\n' "$*"; }
+fail() { printf '\033[31m[thumbs]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- provisioning (sprite, or DISPATCH_FULL=1) ------------------------------
 # Foreground: small and needed by the first session (gh, profile). Background:
@@ -26,6 +26,23 @@ fail() { printf '\033[31m[dispatch]\033[0m %s\n' "$*" >&2; exit 1; }
 # logs to ~/.dispatch/provision.log and never fails the install.
 PLOG="$HOME/.dispatch/provision.log"
 plog() { mkdir -p "$HOME/.dispatch"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$PLOG"; }
+
+# GNU timeout is not part of macOS. The fallback gives the command its own
+# process group so a timed-out npm download cannot leave children running.
+run_bounded() {
+  if command -v timeout >/dev/null; then timeout "$@"; return $?; fi
+  (
+    set +e
+    set -m
+    local seconds="$1"; shift
+    "$@" & local child=$!
+    ( sleep "$seconds"; kill -TERM -- "-$child" 2>/dev/null; sleep 1; kill -KILL -- "-$child" 2>/dev/null ) & local guard=$!
+    wait "$child"; local result=$?
+    kill -TERM -- "-$guard" 2>/dev/null
+    wait "$guard" 2>/dev/null
+    exit "$result"
+  ) 2>/dev/null
+}
 
 provision_gh() {
   command -v gh >/dev/null && { plog "gh: present"; return 0; }
@@ -85,32 +102,52 @@ provision_background() {
 #!/usr/bin/env bash
 # Written by install.sh: the background half of provisioning. Safe to re-run.
 set -u
+set -o pipefail
 BIN_DIR="$BIN_DIR"; PORT="$PORT"; OS="$OS"; ARCH="$ARCH"; REPO="$REPO"; SUDO="${SUDO:-}"
 PLOG="$PLOG"
-$(declare -f plog provision_gh)
+$(declare -f plog provision_gh run_bounded)
 plog "background: start"
 export PATH="\$BIN_DIR:\$HOME/.bun/bin:\$HOME/.npm-global/bin:\$HOME/.opencode/bin:\$PATH"
-provision_gh
 # dispatchd wires its hooks into ~/.claude/settings.json at boot; the plugin
 # install below rewrites the same file. Wait for the boot to be over first.
 for i in \$(seq 1 60); do curl -sf -m 2 "http://127.0.0.1:\$PORT/health" >/dev/null 2>&1 && break; sleep 2; done
 sleep 3
 BGEOF
   cat >> "$runner" <<'BGEOF'
-if ! command -v opencode >/dev/null; then
-  if curl -fsSL -m 60 https://opencode.ai/install 2>/dev/null | bash >/dev/null 2>&1; then plog "opencode: installed"; else plog "opencode: FAILED"; fi
-else plog "opencode: present"; fi
-if command -v npm >/dev/null; then
-  mkdir -p "$HOME/.npm-global"; npm config set prefix "$HOME/.npm-global" >/dev/null 2>&1 || true
-  if ! command -v agent-browser >/dev/null; then
-    if npm install -g agent-browser >/dev/null 2>&1; then plog "agent-browser: installed"; else plog "agent-browser: FAILED"; fi
-  else plog "agent-browser: present"; fi
-  if command -v agent-browser >/dev/null && [ ! -d "$HOME/.agent-browser/browsers" ]; then
-    if agent-browser install >/dev/null 2>&1; then plog "chrome: installed"; else plog "chrome: FAILED"; fi
+# Required agents install concurrently into separate private prefixes. Never
+# change global npm config or replace a working user-installed executable.
+install_agent() {
+  local tool="$1" package="$2" prefix="$HOME/.local/share/thumbs-tools/$1"
+  if command -v "$tool" >/dev/null && run_bounded 5 "$tool" --version >/dev/null 2>&1; then plog "$tool: present"; return; fi
+  if ! command -v npm >/dev/null; then plog "$tool: FAILED (npm unavailable)"; return; fi
+  mkdir -p "$prefix" "$BIN_DIR"
+  if run_bounded 75 npm install --prefix "$prefix" --no-audit --no-fund "$package" >/dev/null 2>&1 \
+     && [ -x "$prefix/node_modules/.bin/$tool" ]; then
+    ln -sf "$prefix/node_modules/.bin/$tool" "$BIN_DIR/$tool"
+    plog "$tool: installed"
+  else plog "$tool: FAILED"; fi
+}
+install_agent claude @anthropic-ai/claude-code & claude_pid=$!
+install_agent codex @openai/codex & codex_pid=$!
+install_agent opencode opencode-ai & opencode_pid=$!
+wait "$claude_pid" "$codex_pid" "$opencode_pid" || true
+missing=""
+for tool in claude codex opencode; do
+  if ! command -v "$tool" >/dev/null || ! run_bounded 5 "$tool" --version >/dev/null 2>&1; then
+    missing="${missing}${missing:+,}\"$tool\""
   fi
-else plog "agent-browser: no npm, skipped"; fi
+done
+state=ready; [ -z "$missing" ] || state=failed
+printf '{"state":"%s","missing":[%s]}\n' "$state" "$missing" > "$HOME/.dispatch/provision-status.json.tmp"
+mv "$HOME/.dispatch/provision-status.json.tmp" "$HOME/.dispatch/provision-status.json"
+plog "required agents: $state"
+provision_gh
+install_agent agent-browser agent-browser
+if command -v agent-browser >/dev/null && [ ! -d "$HOME/.agent-browser/browsers" ]; then
+  if agent-browser install >/dev/null 2>&1; then plog "chrome: installed"; else plog "chrome: FAILED"; fi
+fi
 if command -v claude >/dev/null; then
-  if timeout 120 claude plugin marketplace add obra/superpowers-marketplace </dev/null >/dev/null 2>&1      && timeout 120 claude plugin install superpowers@superpowers-marketplace --scope user </dev/null >/dev/null 2>&1; then plog "superpowers: installed"; else plog "superpowers: FAILED (install from the app later)"; fi
+  if run_bounded 120 claude plugin marketplace add obra/superpowers-marketplace </dev/null >/dev/null 2>&1      && run_bounded 120 claude plugin install superpowers@superpowers-marketplace --scope user </dev/null >/dev/null 2>&1; then plog "superpowers: installed"; else plog "superpowers: FAILED (install from the app later)"; fi
 fi
 plog "background: done"
 date -u +%FT%TZ > "$HOME/.dispatch/provisioned"
@@ -127,6 +164,9 @@ provision_foreground() {
   mkdir -p "$BIN_DIR"
   export PATH="$BIN_DIR:$PATH"
   plog "foreground: start"
+  # Atomic marker exists before /health can answer: no legacy-ready window.
+  printf '%s\n' '{"state":"preparing","missing":["claude","codex","opencode"]}' > "$HOME/.dispatch/provision-status.json.tmp"
+  mv "$HOME/.dispatch/provision-status.json.tmp" "$HOME/.dispatch/provision-status.json"
   provision_profile || true
   plog "foreground: done"
 }
@@ -284,7 +324,7 @@ elif command -v systemctl >/dev/null && { [ "$(id -u)" = 0 ] || [ -n "$SUDO" ]; 
   say "installing systemd service (runs as $RUN_USER)"
   $SUDO tee /etc/systemd/system/dispatchd.service >/dev/null <<UNIT
 [Unit]
-Description=Dispatch agent control plane
+Description=Thumbs agent control plane
 After=network-online.target
 
 [Service]
@@ -342,7 +382,7 @@ RELAY_UP="$(printf '%s' "$HEALTH" | jq -r '.relay.connected // false' 2>/dev/nul
 
 printf '\n'
 say "dispatchd $VERSION is running ✓"
-printf '\n  \033[1mPair this box in the Dispatch app\033[0m  (Settings → Boxes → Add box)\n\n'
+printf '\n  \033[1mPair this box in the Thumbs app\033[0m  (Settings → Boxes → Add box)\n\n'
 [ -n "$SPRITE_URL" ] && printf '    Server:  %s   (sprite — public HTTPS, preferred)\n' "$SPRITE_URL"
 [ -n "$RELAY_URL" ]  && printf '    Server:  %s   (relay — works from anywhere)\n' "$RELAY_URL"
 [ -n "$TSHOST" ] && printf '    Server:  http://%s:%s   (tailnet — preferred)\n' "$TSHOST" "$PORT"
@@ -368,7 +408,7 @@ if command -v qrencode >/dev/null && [ -n "$PAIR_SERVER" ]; then
   # app's Linking.parse decodes params — ':' and '/' must not read as URL
   # structure. The token is hex, safe as-is.
   ENC_SERVER="$(printf '%s' "$PAIR_SERVER" | sed -e 's,%,%25,g' -e 's,:,%3A,g' -e 's,/,%2F,g')"
-  printf '  \033[1mOr scan with the phone camera\033[0m — opens the Dispatch app and pairs in one tap:\n\n'
+  printf '  \033[1mOr scan with the phone camera\033[0m — opens the Thumbs app and pairs in one tap:\n\n'
   qrencode -t ANSIUTF8 -m 2 "dispatch://pair?server=$ENC_SERVER&token=$TOKEN" | sed 's/^/    /'
   printf '\n'
 fi
