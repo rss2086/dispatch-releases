@@ -123,8 +123,18 @@ install_agent() {
   mkdir -p "$prefix" "$BIN_DIR"
   if run_bounded 75 npm install --prefix "$prefix" --no-audit --no-fund "$package" >/dev/null 2>&1 \
      && [ -x "$prefix/node_modules/.bin/$tool" ]; then
-    ln -sf "$prefix/node_modules/.bin/$tool" "$BIN_DIR/$tool"
-    plog "$tool: installed"
+    # npm can leave OpenCode's launcher installed while lifecycle scripts are
+    # disabled. Run only that package's required setup; keep global npm policy.
+    # Verify the candidate before replacing an executable on the user's PATH.
+    if [ "$tool" = opencode ] \
+       && ! run_bounded 5 "$prefix/node_modules/.bin/$tool" --version >/dev/null 2>&1 \
+       && [ -f "$prefix/node_modules/opencode-ai/postinstall.mjs" ]; then
+      run_bounded 20 node "$prefix/node_modules/opencode-ai/postinstall.mjs" >/dev/null 2>&1 || true
+    fi
+    if run_bounded 5 "$prefix/node_modules/.bin/$tool" --version >/dev/null 2>&1; then
+      ln -sf "$prefix/node_modules/.bin/$tool" "$BIN_DIR/$tool"
+      plog "$tool: installed"
+    else plog "$tool: FAILED (installed executable did not start)"; fi
   else plog "$tool: FAILED"; fi
 }
 install_agent claude @anthropic-ai/claude-code & claude_pid=$!
