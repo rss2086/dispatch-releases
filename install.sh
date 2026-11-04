@@ -63,10 +63,14 @@ provision_gh() {
   plog "gh: FAILED (install it later: https://cli.github.com)"; return 0
 }
 
-# ~/.claude/{CLAUDE.md,settings.json,skills/*} from the release's profile.tar.gz.
-# Existing files win: re-running never overwrites a person's edits.
+# ~/.claude/{CLAUDE.md,settings.json,skills/*} (and the same skills in
+# ~/.agents/skills, where Codex reads them) from the release's profile.tar.gz.
+# The rules live in `dispatchd profile-sync` (server/src/profile-sync.ts), the
+# same code a self-updated dispatchd runs at boot: missing → installed; a
+# starter skill nobody edited → replaced by the new version; an edited one →
+# kept and logged; CLAUDE.md/settings.json are never overwritten.
 provision_profile() {
-  local tmp url n=0
+  local tmp url n=0 out="" sync="${DISPATCH_PROFILE_SYNC_BIN:-$BIN_DIR/dispatchd}"
   tmp="$(mktemp -d)"
   if [ -n "${DISPATCH_PROFILE_TAR:-}" ]; then
     tar -xzf "$DISPATCH_PROFILE_TAR" -C "$tmp" 2>/dev/null || { plog "profile: bad local tarball"; rm -rf "$tmp"; return 0; }
@@ -75,6 +79,12 @@ provision_profile() {
     # 20 s cap: this runs before the service starts, inside the broker's budget.
     curl -fsSL -m 20 "$url" | tar -xz -C "$tmp" 2>/dev/null || { plog "profile: download failed ($url)"; rm -rf "$tmp"; return 0; }
   fi
+  if [ -x "$sync" ] && out="$("$sync" profile-sync --dir "$tmp" 2>&1)"; then
+    while IFS= read -r l; do [ -n "$l" ] && plog "profile: $l"; done <<<"$out"
+    rm -rf "$tmp"; return 0
+  fi
+  # No runnable dispatchd (provisioning-only runs): copy what is missing.
+  [ -n "$out" ] && plog "profile: profile-sync failed (${out##*$'\n'}) — copying missing items only"
   mkdir -p "$HOME/.claude/skills"
   for f in CLAUDE.md settings.json; do
     [ -f "$tmp/$f" ] || continue
