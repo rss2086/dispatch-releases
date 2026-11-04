@@ -166,8 +166,112 @@ install_agent agent-browser agent-browser
 if command -v agent-browser >/dev/null && [ ! -d "$HOME/.agent-browser/browsers" ]; then
   if agent-browser install >/dev/null 2>&1; then plog "chrome: installed"; else plog "chrome: FAILED"; fi
 fi
+# Office work: decks, spreadsheets, documents and flyers are most of what
+# people ask a computer for. LibreOffice renders them to PDF/PNG (the agent
+# checks its own slides; the phone's Results show page one), poppler draws
+# pages, and the Python libraries write real .pptx/.xlsx/.docx files.
+office_missing=""
+for pkg in libreoffice-calc libreoffice-writer libreoffice-impress poppler-utils fonts-dejavu-core fonts-liberation2; do
+  dpkg -s "$pkg" >/dev/null 2>&1 || office_missing="$office_missing $pkg"
+done
+if [ -z "$office_missing" ]; then plog "office: present"
+elif command -v apt-get >/dev/null && [ -n "$SUDO$([ "$(id -u)" = 0 ] && echo root)" ]; then
+  if run_bounded 600 $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $office_missing >/dev/null 2>&1; then plog "office: installed"
+  else plog "office: FAILED ($office_missing)"; fi
+else plog "office: skipped (no apt/sudo:$office_missing)"; fi
+if command -v python3 >/dev/null && ! python3 -c 'import pptx, openpyxl, docx' >/dev/null 2>&1; then
+  if run_bounded 180 python3 -m pip install --user -q --break-system-packages python-pptx openpyxl python-docx >/dev/null 2>&1 \
+     || run_bounded 180 python3 -m pip install --user -q python-pptx openpyxl python-docx >/dev/null 2>&1; then plog "office python: installed"
+  else plog "office python: FAILED"; fi
+fi
+# OfficeCLI (Apache-2.0, iOfficeAI/OfficeCLI): one static binary that edits
+# .docx/.xlsx/.pptx and renders them to PNG with no LibreOffice and no root,
+# so a sprite can check its own slides and the phone's Results show page one.
+# Pinned; the checksum comes from the same release.
+OFFICECLI_VERSION=v1.0.160
+if command -v officecli >/dev/null; then plog "officecli: present"
+else
+  oc_os=linux; [ "$OS" = darwin ] && oc_os=mac
+  oc_asset="officecli-$oc_os-$ARCH"; oc_tmp="$(mktemp -d)"
+  oc_base="https://github.com/iOfficeAI/OfficeCLI/releases/download/$OFFICECLI_VERSION"
+  if run_bounded 120 curl -fsSL -o "$oc_tmp/$oc_asset" "$oc_base/$oc_asset" \
+     && run_bounded 30 curl -fsSL -o "$oc_tmp/SHA256SUMS" "$oc_base/SHA256SUMS" \
+     && (cd "$oc_tmp" && grep " \*\?$oc_asset\$" SHA256SUMS | { command -v sha256sum >/dev/null && sha256sum -c - || shasum -a 256 -c -; } >/dev/null 2>&1); then
+    mkdir -p "$BIN_DIR" && install -m 755 "$oc_tmp/$oc_asset" "$BIN_DIR/officecli" && plog "officecli: installed $OFFICECLI_VERSION"
+  else plog "officecli: FAILED"; fi
+  rm -rf "$oc_tmp"
+fi
 if command -v claude >/dev/null; then
   if run_bounded 120 claude plugin marketplace add obra/superpowers-marketplace </dev/null >/dev/null 2>&1      && run_bounded 120 claude plugin install superpowers@superpowers-marketplace --scope user </dev/null >/dev/null 2>&1; then plog "superpowers: installed"; else plog "superpowers: FAILED (install from the app later)"; fi
+fi
+# The storytold "Craft" apps (MIT/Apache): clean-room Word, Excel,
+# PowerPoint, page layout and PDF in Rust, each with a headless CLI. Thumbs'
+# in-app editor (server/src/craft/) drives them: inspect a file, apply the
+# person's edits, render the page the phone taps on. WordCraft's MCP also
+# gives agents 422 real word-processor commands. Only each CLI is kept.
+# Pinned; every archive is checked against its release's SHA256SUMS.txt.
+# Linux: <repo>-<ver>-linux-<x86_64|aarch64>.tar.gz, extract */bin/<repo>-cli.
+# macOS: <repo>-cli-<ver>-macos-universal.zip (all five ship one).
+install_craft() {
+  local repo="$1" ver="$2" bin="$1-cli" tmp base asset arch
+  if command -v "$bin" >/dev/null || [ -x "$BIN_DIR/$bin" ]; then plog "$repo: present"; return 0; fi
+  tmp="$(mktemp -d)"; base="https://github.com/storytold/$repo/releases/download/v$ver"
+  if [ "$OS" = darwin ]; then asset="$repo-cli-$ver-macos-universal.zip"
+  else arch=x86_64; [ "$ARCH" = arm64 ] && arch=aarch64; asset="$repo-$ver-linux-$arch.tar.gz"; fi
+  if run_bounded 300 curl -fsSL -o "$tmp/$asset" "$base/$asset" \
+     && run_bounded 30 curl -fsSL -o "$tmp/SHA256SUMS.txt" "$base/SHA256SUMS.txt" \
+     && (cd "$tmp" && grep " \*\?$asset\$" SHA256SUMS.txt | { command -v sha256sum >/dev/null && sha256sum -c - || shasum -a 256 -c -; } >/dev/null 2>&1); then
+    case "$asset" in
+      *.zip) (cd "$tmp" && unzip -q "$asset") ;;
+      *) tar -xzf "$tmp/$asset" -C "$tmp" --wildcards "*/bin/$bin" ;;
+    esac
+    local found; found="$(find "$tmp" -type f -name "$bin" | head -1)"
+    if [ -n "$found" ]; then mkdir -p "$BIN_DIR" && install -m 755 "$found" "$BIN_DIR/$bin" && plog "$repo: installed $ver"
+    else plog "$repo: FAILED (no $bin in $asset)"; fi
+  else plog "$repo: FAILED"; fi
+  rm -rf "$tmp"
+}
+WORDCRAFT_VERSION=0.15.0
+GRIDCRAFT_VERSION=0.16.0
+DECKCRAFT_VERSION=0.15.0
+DESIGNCRAFT_VERSION=0.17.0
+PDFCRAFT_VERSION=0.18.0
+install_craft wordcraft "$WORDCRAFT_VERSION"
+install_craft gridcraft "$GRIDCRAFT_VERSION"
+install_craft deckcraft "$DECKCRAFT_VERSION"
+install_craft designcraft "$DESIGNCRAFT_VERSION"
+install_craft pdfcraft "$PDFCRAFT_VERSION"
+# Emoji in the editors' page pictures: DeckCraft and DesignCraft draw only
+# outline fonts and fall back to "Noto Emoji" by name; a colour-bitmap emoji
+# font (what most boxes have, if any) draws as empty boxes there. Google's
+# monochrome Noto Emoji (OFL), pinned to a google/fonts commit and checked,
+# into ~/.dispatch/fonts — server/src/craft/index.ts shows it to every CLI
+# run through the run's private HOME. No sudo, no system font change.
+NOTO_EMOJI_URL="https://raw.githubusercontent.com/google/fonts/b979dba422e445492b0eb9951ac52ee0b4d648c3/ofl/notoemoji/NotoEmoji%5Bwght%5D.ttf"
+NOTO_EMOJI_SHA=de6c18832938afc99caf132b39d6a30a19bac7f2e812e28db2535b4608d27551
+FONT_DIR="$HOME/.dispatch/fonts"
+if [ -f "$FONT_DIR/NotoEmoji.ttf" ]; then plog "noto emoji: present"
+else
+  font_tmp="$(mktemp)"
+  if run_bounded 120 curl -fsSL -o "$font_tmp" "$NOTO_EMOJI_URL" \
+     && [ "$( { command -v sha256sum >/dev/null && sha256sum "$font_tmp" || shasum -a 256 "$font_tmp"; } | awk '{print $1}')" = "$NOTO_EMOJI_SHA" ]; then
+    mkdir -p "$FONT_DIR" && install -m 644 "$font_tmp" "$FONT_DIR/NotoEmoji.ttf" && plog "noto emoji: installed"
+  else plog "noto emoji: FAILED (emoji draw as boxes in deck and flyer pictures)"; fi
+  rm -f "$font_tmp"
+fi
+if command -v claude >/dev/null && command -v wordcraft-cli >/dev/null && ! claude mcp get wordcraft </dev/null >/dev/null 2>&1; then
+  if run_bounded 30 claude mcp add --scope user wordcraft -- "$(command -v wordcraft-cli)" mcp </dev/null >/dev/null 2>&1; then plog "wordcraft mcp: added"
+  else plog "wordcraft mcp: FAILED"; fi
+fi
+# Anthropic's own skills, fetched from their marketplace on this box (never
+# redistributed in profile/: the document skills are not open source).
+# document-skills = pptx, xlsx, docx, pdf; example-skills carries
+# canvas-design (posters, flyers, art) and theme-factory (consistent looks).
+if command -v claude >/dev/null; then
+  if run_bounded 120 claude plugin marketplace add anthropics/skills </dev/null >/dev/null 2>&1 \
+     && run_bounded 120 claude plugin install document-skills@anthropic-agent-skills --scope user </dev/null >/dev/null 2>&1 \
+     && run_bounded 120 claude plugin install example-skills@anthropic-agent-skills --scope user </dev/null >/dev/null 2>&1; then plog "anthropic skills: installed"
+  else plog "anthropic skills: FAILED (claude plugin install document-skills@anthropic-agent-skills)"; fi
 fi
 plog "background: done"
 date -u +%FT%TZ > "$HOME/.dispatch/provisioned"
