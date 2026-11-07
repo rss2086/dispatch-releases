@@ -471,10 +471,48 @@ elif [ -n "$ON_SPRITE" ]; then
 while true; do "$BIN"; sleep 2; done
 LOOPEOF
   chmod 755 "$LOOP"
+  # Emailed work runs only inside bubblewrap (server/src/mail-sandbox.ts), and
+  # stock bwrap refuses to start on a sprite twice over: every process has
+  # ambient capabilities ("Unexpected capabilities but not setuid"), and the
+  # runtime's read-only masks over /proc/kcore, keys, timer_list and scsi make
+  # the kernel refuse a fresh /proc in a new user namespace. This wrapper, root
+  # owned, removes the masks in a PRIVATE mount namespace only (the box's own
+  # /proc keeps them), clears ambient and inheritable capabilities, drops back
+  # to the box user and runs the real bwrap with the server's flags unchanged.
+  # It also sets kernel.dmesg_restrict, because the kernel log was readable
+  # from inside the sandbox through syslog(2) (bwrap's /dev has no kmsg).
+  # The server's probe still really starts a sandbox through it before every
+  # job, so a wrapper that stops working refuses email, never runs it outside.
+  # Measured 2026-11-07: 65 escape attempts blocked, 0 leaked.
+  # No sudo, or no setpriv/unshare: nothing is written, and email stays off
+  # with the reason in Settings, exactly as on any box that can't sandbox.
+  SPRITE_BWRAP=/usr/local/libexec/thumbs/bwrap-sprite
+  SPRITE_BWRAP_ENV=""
+  if [ -n "$SUDO" ] && [ -x /usr/bin/bwrap ] && [ -x /usr/bin/setpriv ] && [ -x /usr/bin/unshare ]; then
+    $SUDO mkdir -p "$(dirname "$SPRITE_BWRAP")"
+    $SUDO tee "$SPRITE_BWRAP" >/dev/null <<'BWRAPEOF'
+#!/bin/bash
+# Written by install.sh on a Fly Sprite (see the comment there). Arguments go to
+# /usr/bin/bwrap unchanged; the caller's uid and gid come back before it runs,
+# and env -i again, because sudo's own environment (SUDO_COMMAND names every
+# host path in the command) would otherwise be readable at /proc/1/environ inside.
+uid="$(id -u)"; gid="$(id -g)"
+exec /usr/bin/sudo -n /usr/bin/unshare -m /bin/bash -c '
+  for m in /proc/kcore /proc/keys /proc/timer_list /proc/scsi; do /usr/bin/umount -l "$m" 2>/dev/null || /bin/umount -l "$m" 2>/dev/null || true; done
+  { printf 1 > /proc/sys/kernel/dmesg_restrict; } 2>/dev/null || true
+  u="$0"; g="$1"; shift
+  exec /usr/bin/env -i /usr/bin/setpriv --reuid="$u" --regid="$g" --clear-groups --ambient-caps=-all --inh-caps=-all /usr/bin/bwrap "$@"' "$uid" "$gid" "$@"
+BWRAPEOF
+    $SUDO chown root:root "$SPRITE_BWRAP"
+    $SUDO chmod 755 "$SPRITE_BWRAP"
+    SPRITE_BWRAP_ENV=",DISPATCH_BWRAP=$SPRITE_BWRAP"
+  else
+    say "no sudo/setpriv here: emailed work stays off on this sprite (it only runs sandboxed)"
+  fi
   # --env is comma-separated: PATH may hold colons but never commas.
   sprite-env services create dispatchd \
     --cmd /usr/bin/env --args "bash,$LOOP" --dir "$HOME" \
-    --env "HOME=$HOME,DISPATCH_PORT=$PORT,DISPATCH_WORKSPACE=$DISPATCH_WORKSPACE,PATH=$HOME/.local/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:/.sprite/bin:/usr/local/bin:/usr/bin:/bin" \
+    --env "HOME=$HOME,DISPATCH_PORT=$PORT,DISPATCH_WORKSPACE=$DISPATCH_WORKSPACE,PATH=$HOME/.local/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:/.sprite/bin:/usr/local/bin:/usr/bin:/bin$SPRITE_BWRAP_ENV" \
     --http-port "$PORT" --no-stream >/dev/null
 elif command -v systemctl >/dev/null && { [ "$(id -u)" = 0 ] || [ -n "$SUDO" ]; }; then
   say "installing systemd service (runs as $RUN_USER)"
