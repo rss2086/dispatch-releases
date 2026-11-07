@@ -360,6 +360,15 @@ if [ -n "$missing" ]; then
   fi
 fi
 
+# bubblewrap is best-effort too: emailed work only ever runs inside it, so a box
+# without it refuses email and says why in Settings. Never a reason to fail here.
+if [ "$OS" != darwin ] && ! command -v bwrap >/dev/null; then
+  if command -v apt-get >/dev/null; then $SUDO apt-get install -y -qq bubblewrap >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null; then $SUDO dnf install -y -q bubblewrap >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null; then $SUDO apk add -q bubblewrap >/dev/null 2>&1 || true
+  fi
+fi
+
 # qrencode is best-effort: it draws the pairing QR at the end. Never a reason
 # to fail the install — without it the card degrades to URL + token as text.
 if ! command -v qrencode >/dev/null; then
