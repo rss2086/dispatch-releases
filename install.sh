@@ -259,6 +259,29 @@ else
   else plog "noto emoji: FAILED (emoji draw as boxes in deck and flyer pictures)"; fi
   rm -f "$font_tmp"
 fi
+# Georgia in deck pictures and PDFs: the editorial deck theme uses Georgia, which
+# PowerPoint and iPhones have and a Linux box does not. Gelasio (OFL) has Georgia's
+# widths. Static faces, because DeckCraft draws a variable font at its default
+# weight only. Pinned to a commit and checked, into ~/.dispatch/fonts for the
+# editors, linked into ~/.local/share/fonts for agents and LibreOffice (fontconfig
+# maps Georgia to it). DeckCraft does not substitute by itself: a render swaps the
+# name first (office-work skill, server/src/craft/deck.ts).
+GELASIO_BASE="https://raw.githubusercontent.com/SorkinType/Gelasio/7ab20e7e5c42791e603b9ee3201a0b49849cfdb2/fonts/ttf"
+gelasio_ok=1
+for g in Regular:48c797fbe0e07c48a18cb962e7bdfa23f19618327dddf54093265328dc9eb39d Bold:e0ef3addf1acf35f5c6aef2be00d0a2c01363bf70a5950e16650976051a0c462 Italic:1d8bda4ff258bb8251eae4f7d7500c8d97d084136192bb264bc2305168765d1b BoldItalic:aa87e21b46aef3dcb50a68dc6e1946f0c0a9819d067e4be6a98a6daa8f5b3c16; do
+  g_name="Gelasio-${g%%:*}.ttf"
+  if [ ! -f "$FONT_DIR/$g_name" ]; then
+    font_tmp="$(mktemp)"
+    if run_bounded 60 curl -fsSL -o "$font_tmp" "$GELASIO_BASE/$g_name" \
+       && [ "$( { command -v sha256sum >/dev/null && sha256sum "$font_tmp" || shasum -a 256 "$font_tmp"; } | awk '{print $1}')" = "${g##*:}" ]; then
+      mkdir -p "$FONT_DIR" && install -m 644 "$font_tmp" "$FONT_DIR/$g_name"
+    else gelasio_ok=0; fi
+    rm -f "$font_tmp"
+  fi
+  if [ -f "$FONT_DIR/$g_name" ]; then mkdir -p "$HOME/.local/share/fonts" && ln -sf "$FONT_DIR/$g_name" "$HOME/.local/share/fonts/$g_name"; fi
+done
+if [ "$gelasio_ok" = 1 ]; then plog "gelasio: ready"; else plog "gelasio: FAILED (Georgia draws as a sans in deck pictures)"; fi
+command -v fc-cache >/dev/null && fc-cache -f "$HOME/.local/share/fonts" >/dev/null 2>&1 || true
 if command -v claude >/dev/null && command -v wordcraft-cli >/dev/null && ! claude mcp get wordcraft </dev/null >/dev/null 2>&1; then
   if run_bounded 30 claude mcp add --scope user wordcraft -- "$(command -v wordcraft-cli)" mcp </dev/null >/dev/null 2>&1; then plog "wordcraft mcp: added"
   else plog "wordcraft mcp: FAILED"; fi
