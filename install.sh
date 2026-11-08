@@ -167,11 +167,12 @@ if command -v agent-browser >/dev/null && [ ! -d "$HOME/.agent-browser/browsers"
   if agent-browser install >/dev/null 2>&1; then plog "chrome: installed"; else plog "chrome: FAILED"; fi
 fi
 # Office work: decks, spreadsheets, documents and flyers are most of what
-# people ask a computer for. LibreOffice renders them to PDF/PNG (the agent
-# checks its own slides; the phone's Results show page one), poppler draws
-# pages, and the Python libraries write real .pptx/.xlsx/.docx files.
+# people ask a computer for. poppler draws PDF pages and the Python libraries
+# write real .pptx/.xlsx/.docx files. No LibreOffice (2026-11-08): its apt
+# install timed out at 10 min on a fresh sprite; WordCraft and OfficeCLI
+# below render Office files without it.
 office_missing=""
-for pkg in libreoffice-calc libreoffice-writer libreoffice-impress poppler-utils fonts-dejavu-core fonts-liberation2; do
+for pkg in poppler-utils fonts-dejavu-core fonts-liberation2; do
   dpkg -s "$pkg" >/dev/null 2>&1 || office_missing="$office_missing $pkg"
 done
 if [ -z "$office_missing" ]; then plog "office: present"
